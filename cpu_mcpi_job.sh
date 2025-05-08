@@ -17,9 +17,46 @@ echo "Setting up environment..."
 # module load anaconda3/latest   # Or miniconda
 module load openmpi/4.1.1     # Or an MPI implementation compatible with mpi4py
 module load anaconda3/anaconda3
-# Activate your Conda environment (adjust path and name)
-# source /path/to/your/conda/etc/profile.d/conda.sh
-# conda activate your_python_mpi_env
+
+# Define Python and Pip executables - default to direct paths
+PYTHON_EXEC="/home/apps/anaconda3/envs/pytorch-gpu/bin/python"
+PIP_EXEC="/home/apps/anaconda3/envs/pytorch-gpu/bin/pip"
+CONDA_ENV_NAME="pytorch-gpu"
+CONDA_BASE_DIR="/home/apps/anaconda3" # Adjust if your Anaconda/Miniconda base is different
+
+echo "Attempting to activate Conda environment: ${CONDA_ENV_NAME}"
+if [ -f "${CONDA_BASE_DIR}/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    source "${CONDA_BASE_DIR}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV_NAME}"
+    ACTIVATION_STATUS=$?
+    if [ $ACTIVATION_STATUS -eq 0 ]; then
+        echo "Conda environment '${CONDA_ENV_NAME}' activated successfully."
+        # If activation is successful, pip and python should be in PATH
+        PYTHON_EXEC="python"
+        PIP_EXEC="pip"
+    else
+        echo "Failed to activate Conda environment '${CONDA_ENV_NAME}' (status: ${ACTIVATION_STATUS}). Falling back to direct paths: ${PYTHON_EXEC}"
+    fi
+else
+    echo "conda.sh not found at ${CONDA_BASE_DIR}/etc/profile.d/conda.sh. Falling back to direct paths: ${PYTHON_EXEC}"
+fi
+
+# Ensure necessary packages are installed from requirements.txt
+echo "Ensuring packages from requirements.txt are installed using ${PIP_EXEC}..."
+REQUIREMENTS_FILE="requirements.txt" # Assuming it's in the submission directory
+if [ -f "${REQUIREMENTS_FILE}" ]; then
+    "${PIP_EXEC}" install --progress-bar off -r "${REQUIREMENTS_FILE}"
+    INSTALL_STATUS=$?
+    if [ $INSTALL_STATUS -ne 0 ]; then
+        echo "WARNING: '${PIP_EXEC} install -r ${REQUIREMENTS_FILE}' failed with status ${INSTALL_STATUS}. Dependency issues may persist."
+    else
+        echo "Successfully processed ${REQUIREMENTS_FILE}."
+    fi
+else
+    echo "WARNING: ${REQUIREMENTS_FILE} not found. Skipping pip install -r. Ensure dependencies are met in the environment."
+fi
+echo "Dependency check/installation attempt complete."
 
 echo "--- Slurm Configuration ---"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-N/A (not in Slurm job)}"
@@ -36,32 +73,26 @@ JOB_OUTPUT_DIR="${OUTPUT_DIR_BASE}/run_${TIMESTAMP}_${SLURM_JOB_ID:-local}"
 mkdir -p "${JOB_OUTPUT_DIR}"
 echo "Output will be stored in: ${JOB_OUTPUT_DIR}"
 
-# --- System Metrics Logging (All Nodes) ---
+# --- System Metrics Logging (Master Node Only) ---
 SYSTEM_METRICS_INTERVAL=3 # Log every 3 seconds
 LOG_SCRIPT_PATH="./log_system_metrics.py" # Assuming it's in the current directory
+LOCAL_LOGGER_PID="" # Initialize PID variable
 
-echo "Starting system metrics logging on all allocated nodes (interval: ${SYSTEM_METRICS_INTERVAL}s)."
+echo "Starting system metrics logging on the master node only (interval: ${SYSTEM_METRICS_INTERVAL}s)."
+LOCAL_NODE_NAME=$(hostname -s) # Get short hostname of the current node
 
-# Create a small wrapper script that each node will execute to capture its own hostname
-cat > "${JOB_OUTPUT_DIR}/run_logger.sh" << 'EOF'
-#!/bin/bash
-NODE_NAME=$(hostname)
-OUTPUT_DIR=$1
-INTERVAL=$2
-LOG_SCRIPT=$3
-PYTHON_PATH=$4
+if [ -f "${PYTHON_EXEC}" ] && [ -f "${LOG_SCRIPT_PATH}" ]; then
+    "${PYTHON_EXEC}" "${LOG_SCRIPT_PATH}" --output "${JOB_OUTPUT_DIR}/system_metrics_${LOCAL_NODE_NAME}.csv" --interval "${SYSTEM_METRICS_INTERVAL}" &
+    LOCAL_LOGGER_PID=$!
+    echo "Local system metrics logger started with PID: ${LOCAL_LOGGER_PID} on node ${LOCAL_NODE_NAME}."
+    echo "Metrics will be saved to: ${JOB_OUTPUT_DIR}/system_metrics_${LOCAL_NODE_NAME}.csv"
+else
+    echo "Error: Python executable or log script not found. Cannot start local logger."
+    echo "PYTHON_EXEC: ${PYTHON_EXEC}"
+    echo "LOG_SCRIPT_PATH: ${LOG_SCRIPT_PATH}"
+fi
 
-echo "Starting logger on node: ${NODE_NAME}"
-"${PYTHON_PATH}" "${LOG_SCRIPT}" --output "${OUTPUT_DIR}/system_metrics_${NODE_NAME}.csv" --interval "${INTERVAL}"
-EOF
-
-chmod +x "${JOB_OUTPUT_DIR}/run_logger.sh"
-
-# Launch one logger per node using the wrapper script
-srun --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --overlap \
-    "${JOB_OUTPUT_DIR}/run_logger.sh" "${JOB_OUTPUT_DIR}" "${SYSTEM_METRICS_INTERVAL}" "${LOG_SCRIPT_PATH}" "/home/apps/anaconda3/envs/pytorch-gpu/bin/python" &
-
-echo "System metrics loggers launched via srun in the background."
+echo "System metrics logger (local only) launched in the background."
 
 # --- Monte Carlo Task Parameters ---
 # Total samples: e.g., 2 nodes * 4 tasks/node * 8 cpus/task * 2,000,000 samples/core = 128,000,000
@@ -78,7 +109,7 @@ echo "--------------------------"
 # --- MPI Execution Command ---
 CPU_TASK_SCRIPT_PATH="./cpu_monte_carlo_pi.py" # Assuming it's in the current directory
 
-CMD_TO_RUN="mpirun -np $SLURM_NTASKS /home/apps/anaconda3/envs/pytorch-gpu/bin/python ${CPU_TASK_SCRIPT_PATH} --total-samples ${TOTAL_SAMPLES} --mp-batch-size ${MP_BATCH_SIZE}"
+CMD_TO_RUN="mpirun -np $SLURM_NTASKS ${PYTHON_EXEC} ${CPU_TASK_SCRIPT_PATH} --total-samples ${TOTAL_SAMPLES} --mp-batch-size ${MP_BATCH_SIZE}"
 
 echo "Executing command: ${CMD_TO_RUN}"
 echo "--- CPU Task Output START ---"
@@ -90,57 +121,43 @@ echo "--- CPU Task Output END ---"
 echo "CPU task finished with exit code: ${TASK_EXIT_CODE}. Duration: ${DURATION} seconds."
 
 
-# --- Cleanup of Background Loggers (All Nodes) ---
-echo "Attempting to stop system metrics loggers on all nodes..."
+# --- Cleanup of Local Background Logger ---
+echo "Attempting to stop local system metrics logger (PID: ${LOCAL_LOGGER_PID})..."
 
-# Create a cleanup script that each node will run to find and stop its logger
-cat > "${JOB_OUTPUT_DIR}/stop_logger.sh" << 'EOF'
-#!/bin/bash
-NODE_NAME=$(hostname)
-PYTHON_PATH=$1
-echo "Stopping logger on ${NODE_NAME}..."
-
-# Find the Python process running the log_system_metrics.py script
-# Using the specific Python path when searching
-LOGGER_PID=$(ps -ef | grep "${PYTHON_PATH}.*log_system_metrics.py" | grep -v grep | awk '{print $2}')
-
-if [ -n "$LOGGER_PID" ]; then
-    echo "Found logger process on ${NODE_NAME} with PID: ${LOGGER_PID}, sending SIGINT..."
-    kill -SIGINT $LOGGER_PID
+if [ -n "$LOCAL_LOGGER_PID" ] && ps -p "$LOCAL_LOGGER_PID" > /dev/null; then
+    echo "Sending SIGINT to local logger PID: $LOCAL_LOGGER_PID"
+    kill -SIGINT "$LOCAL_LOGGER_PID"
     
     # Wait for up to 5 seconds for clean shutdown
     for i in {1..5}; do
-        if ! ps -p $LOGGER_PID > /dev/null; then
-            echo "Logger on ${NODE_NAME} terminated gracefully."
-            exit 0
+        if ! ps -p "$LOCAL_LOGGER_PID" > /dev/null; then
+            echo "Local logger on $(hostname -s) terminated gracefully."
+            LOCAL_LOGGER_PID="" # Clear PID
+            break
         fi
         sleep 1
     done
     
     # If still running, force kill
-    if ps -p $LOGGER_PID > /dev/null; then
-        echo "Logger on ${NODE_NAME} did not terminate gracefully after 5s, sending SIGKILL..."
-        kill -SIGKILL $LOGGER_PID
+    if [ -n "$LOCAL_LOGGER_PID" ] && ps -p "$LOCAL_LOGGER_PID" > /dev/null; then
+        echo "Local logger on $(hostname -s) did not terminate gracefully after 5s, sending SIGKILL..."
+        kill -SIGKILL "$LOCAL_LOGGER_PID"
     fi
+elif [ -n "$LOCAL_LOGGER_PID" ]; then
+    echo "Local logger process with PID ${LOCAL_LOGGER_PID} was not found (already terminated or never started properly)."
 else
-    echo "No logger process found on ${NODE_NAME}."
+    echo "No local logger PID was set. Nothing to stop."
 fi
-EOF
 
-chmod +x "${JOB_OUTPUT_DIR}/stop_logger.sh"
-
-# Run the cleanup script on all nodes
-srun --ntasks=${SLURM_NNODES} --ntasks-per-node=1 "${JOB_OUTPUT_DIR}/stop_logger.sh" "/home/apps/anaconda3/envs/pytorch-gpu/bin/python"
-
-echo "System metrics logging stop sequence completed."
+echo "Local system metrics logging stop sequence completed."
 
 
-# --- Plot System Metrics (from all nodes) ---
-echo "Plotting system statistics from all nodes..."
+# --- Plot System Metrics (from master node) ---
+echo "Plotting system statistics from the master node..."
 # The plot script now takes the directory containing all metrics files
 PLOT_SCRIPT_PATH="./plot_system_metrics.py"
 if [ -d "${JOB_OUTPUT_DIR}" ]; then
-    /home/apps/anaconda3/envs/pytorch-gpu/bin/python "${PLOT_SCRIPT_PATH}" "${JOB_OUTPUT_DIR}"
+    "${PYTHON_EXEC}" "${PLOT_SCRIPT_PATH}" "${JOB_OUTPUT_DIR}"
     PLOT_SYS_EXIT_CODE=$?
     if [ ${PLOT_SYS_EXIT_CODE} -eq 0 ]; then
         echo "System statistics plotted successfully. Plots are in subdirectories within ${JOB_OUTPUT_DIR}."
@@ -177,7 +194,7 @@ echo "Creating consolidated run summary: ${CONSOLIDATED_SUMMARY_FILE}"
     echo "Multiprocessing Batch Size: ${MP_BATCH_SIZE}"
     echo ""
 
-    echo "=== SYSTEM METRICS LOGS (from all nodes in ${JOB_OUTPUT_DIR}) ==="
+    echo "=== SYSTEM METRICS LOGS (from master node in ${JOB_OUTPUT_DIR}) ==="
     METRICS_FILES_FOUND=0
     for metrics_file in "${JOB_OUTPUT_DIR}"/system_metrics_*.csv; do
         if [ -f "${metrics_file}" ]; then
