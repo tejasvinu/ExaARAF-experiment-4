@@ -28,7 +28,7 @@ def monte_carlo_pi_batch(num_samples_in_batch):
 
 def main():
     parser = argparse.ArgumentParser(description="CPU-intensive Monte Carlo Pi estimation using MPI and multiprocessing.")
-    parser.add_argument('--total-samples', type=int, default=10**10, help='Total number of samples to generate across all processes.')
+    parser.add_argument('--total-samples', type=int, default=int(4e9), help='Total number of samples to generate across all processes.')
     parser.add_argument('--mp-batch-size', type=int, default=10**5, help='Number of samples processed by each multiprocessing worker in a single call.')
     args = parser.parse_args()
 
