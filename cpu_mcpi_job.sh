@@ -1,22 +1,22 @@
 #!/bin/bash
 
 # --- Job Configuration (Adapt for your HPC Scheduler, e.g., Slurm) ---
-# #SBATCH --job-name=cpu_monte_carlo_pi
-# #SBATCH --nodes=2                # Number of nodes to use
-# #SBATCH --ntasks-per-node=4      # Number of MPI tasks (processes) per node
-# #SBATCH --cpus-per-task=8        # Number of CPU cores allocated to each MPI task (for multiprocessing)
-# #SBATCH --mem-per-cpu=2G         # Memory per allocated CPU core
-# #SBATCH --time=00:30:00          # Maximum job run time (HH:MM:SS)
-# #SBATCH --output=cpu_mc_pi_job_%j.out
-# #SBATCH --error=cpu_mc_pi_job_%j.err
-# #SBATCH --partition=cpu_partition # Specify your HPC's CPU partition
+#SBATCH --job-name=cpu_monte_carlo_pi
+#SBATCH --nodes=2                # Number of nodes to use
+#SBATCH --ntasks-per-node=4      # Number of MPI tasks (processes) per node
+#SBATCH --cpus-per-task=8        # Number of CPU cores allocated to each MPI task (for multiprocessing)
+#SBATCH --mem-per-cpu=3G         # Memory per allocated CPU core
+#SBATCH --time=00:30:00          # Maximum job run time (HH:MM:SS)
+#SBATCH --output=cpu_mc_pi_job_%j.out
+#SBATCH --error=cpu_mc_pi_job_%j.err
+#SBATCH --partition=standard # Specify your HPC's CPU partition
 
 # --- Environment Setup ---
 echo "Setting up environment..."
 # Example: Load modules for your HPC. These are placeholders.
 # module load anaconda3/latest   # Or miniconda
 module load openmpi/4.1.1     # Or an MPI implementation compatible with mpi4py
-module load anaconda3/anaconda
+module load anaconda3/anaconda3
 # Activate your Conda environment (adjust path and name)
 # source /path/to/your/conda/etc/profile.d/conda.sh
 # conda activate your_python_mpi_env
@@ -36,13 +36,32 @@ JOB_OUTPUT_DIR="${OUTPUT_DIR_BASE}/run_${TIMESTAMP}_${SLURM_JOB_ID:-local}"
 mkdir -p "${JOB_OUTPUT_DIR}"
 echo "Output will be stored in: ${JOB_OUTPUT_DIR}"
 
-# --- System Metrics Logging ---
-SYSTEM_METRICS_LOG_FILE="${JOB_OUTPUT_DIR}/system_metrics_primary_node.csv"
+# --- System Metrics Logging (All Nodes) ---
 SYSTEM_METRICS_INTERVAL=3 # Log every 3 seconds
-echo "Starting system metrics logging to ${SYSTEM_METRICS_LOG_FILE} (interval: ${SYSTEM_METRICS_INTERVAL}s)."
-python log_system_metrics.py --output "${SYSTEM_METRICS_LOG_FILE}" --interval "${SYSTEM_METRICS_INTERVAL}" &
-SYSTEM_METRICS_PID=$!
-echo "System metrics logger started with PID: ${SYSTEM_METRICS_PID}"
+LOG_SCRIPT_PATH="./log_system_metrics.py" # Assuming it's in the current directory
+
+echo "Starting system metrics logging on all allocated nodes (interval: ${SYSTEM_METRICS_INTERVAL}s)."
+
+# Create a small wrapper script that each node will execute to capture its own hostname
+cat > "${JOB_OUTPUT_DIR}/run_logger.sh" << 'EOF'
+#!/bin/bash
+NODE_NAME=$(hostname)
+OUTPUT_DIR=$1
+INTERVAL=$2
+LOG_SCRIPT=$3
+PYTHON_PATH=$4
+
+echo "Starting logger on node: ${NODE_NAME}"
+"${PYTHON_PATH}" "${LOG_SCRIPT}" --output "${OUTPUT_DIR}/system_metrics_${NODE_NAME}.csv" --interval "${INTERVAL}"
+EOF
+
+chmod +x "${JOB_OUTPUT_DIR}/run_logger.sh"
+
+# Launch one logger per node using the wrapper script
+srun --ntasks=${SLURM_NNODES} --ntasks-per-node=1 --overlap \
+    "${JOB_OUTPUT_DIR}/run_logger.sh" "${JOB_OUTPUT_DIR}" "${SYSTEM_METRICS_INTERVAL}" "${LOG_SCRIPT_PATH}" "/home/apps/anaconda3/envs/pytorch-gpu/bin/python" &
+
+echo "System metrics loggers launched via srun in the background."
 
 # --- Monte Carlo Task Parameters ---
 # Total samples: e.g., 2 nodes * 4 tasks/node * 8 cpus/task * 2,000,000 samples/core = 128,000,000
@@ -59,7 +78,7 @@ echo "--------------------------"
 # --- MPI Execution Command ---
 CPU_TASK_SCRIPT_PATH="./cpu_monte_carlo_pi.py" # Assuming it's in the current directory
 
-CMD_TO_RUN="srun python ${CPU_TASK_SCRIPT_PATH} --total-samples ${TOTAL_SAMPLES} --mp-batch-size ${MP_BATCH_SIZE}"
+CMD_TO_RUN="mpirun -np $SLURM_NTASKS /home/apps/anaconda3/envs/pytorch-gpu/bin/python ${CPU_TASK_SCRIPT_PATH} --total-samples ${TOTAL_SAMPLES} --mp-batch-size ${MP_BATCH_SIZE}"
 
 echo "Executing command: ${CMD_TO_RUN}"
 echo "--- CPU Task Output START ---"
@@ -71,38 +90,65 @@ echo "--- CPU Task Output END ---"
 echo "CPU task finished with exit code: ${TASK_EXIT_CODE}. Duration: ${DURATION} seconds."
 
 
-# --- Cleanup of Background Loggers ---
-if [ -n "$SYSTEM_METRICS_PID" ]; then
-    echo "Stopping system metrics logging (PID: ${SYSTEM_METRICS_PID})..."
-    kill -SIGINT ${SYSTEM_METRICS_PID}
+# --- Cleanup of Background Loggers (All Nodes) ---
+echo "Attempting to stop system metrics loggers on all nodes..."
+
+# Create a cleanup script that each node will run to find and stop its logger
+cat > "${JOB_OUTPUT_DIR}/stop_logger.sh" << 'EOF'
+#!/bin/bash
+NODE_NAME=$(hostname)
+PYTHON_PATH=$1
+echo "Stopping logger on ${NODE_NAME}..."
+
+# Find the Python process running the log_system_metrics.py script
+# Using the specific Python path when searching
+LOGGER_PID=$(ps -ef | grep "${PYTHON_PATH}.*log_system_metrics.py" | grep -v grep | awk '{print $2}')
+
+if [ -n "$LOGGER_PID" ]; then
+    echo "Found logger process on ${NODE_NAME} with PID: ${LOGGER_PID}, sending SIGINT..."
+    kill -SIGINT $LOGGER_PID
     
-    WAIT_TIMEOUT_SECONDS=10
-    elapsed=0
-    while ps -p ${SYSTEM_METRICS_PID} > /dev/null && [ $elapsed -lt $WAIT_TIMEOUT_SECONDS ]; do
+    # Wait for up to 5 seconds for clean shutdown
+    for i in {1..5}; do
+        if ! ps -p $LOGGER_PID > /dev/null; then
+            echo "Logger on ${NODE_NAME} terminated gracefully."
+            exit 0
+        fi
         sleep 1
-        elapsed=$((elapsed + 1))
     done
-
-    if ps -p ${SYSTEM_METRICS_PID} > /dev/null; then
-        echo "System metrics logger (PID: ${SYSTEM_METRICS_PID}) did not stop gracefully after ${WAIT_TIMEOUT_SECONDS}s. Sending SIGKILL."
-        kill -SIGKILL ${SYSTEM_METRICS_PID}
+    
+    # If still running, force kill
+    if ps -p $LOGGER_PID > /dev/null; then
+        echo "Logger on ${NODE_NAME} did not terminate gracefully after 5s, sending SIGKILL..."
+        kill -SIGKILL $LOGGER_PID
     fi
-    wait ${SYSTEM_METRICS_PID} 2>/dev/null
-    echo "System metrics logging stopped."
+else
+    echo "No logger process found on ${NODE_NAME}."
 fi
+EOF
 
-# --- Plot System Metrics ---
-echo "Plotting system statistics..."
-if [ -f "${SYSTEM_METRICS_LOG_FILE}" ]; then
-    python plot_system_metrics.py "${SYSTEM_METRICS_LOG_FILE}"
+chmod +x "${JOB_OUTPUT_DIR}/stop_logger.sh"
+
+# Run the cleanup script on all nodes
+srun --ntasks=${SLURM_NNODES} --ntasks-per-node=1 "${JOB_OUTPUT_DIR}/stop_logger.sh" "/home/apps/anaconda3/envs/pytorch-gpu/bin/python"
+
+echo "System metrics logging stop sequence completed."
+
+
+# --- Plot System Metrics (from all nodes) ---
+echo "Plotting system statistics from all nodes..."
+# The plot script now takes the directory containing all metrics files
+PLOT_SCRIPT_PATH="./plot_system_metrics.py"
+if [ -d "${JOB_OUTPUT_DIR}" ]; then
+    /home/apps/anaconda3/envs/pytorch-gpu/bin/python "${PLOT_SCRIPT_PATH}" "${JOB_OUTPUT_DIR}"
     PLOT_SYS_EXIT_CODE=$?
     if [ ${PLOT_SYS_EXIT_CODE} -eq 0 ]; then
-        echo "System statistics plotted successfully to ${JOB_OUTPUT_DIR}."
+        echo "System statistics plotted successfully. Plots are in subdirectories within ${JOB_OUTPUT_DIR}."
     else
         echo "Warning: System statistics plotting failed with exit code ${PLOT_SYS_EXIT_CODE}."
     fi
 else
-    echo "Warning: System metrics log file ${SYSTEM_METRICS_LOG_FILE} not found. Skipping plotting."
+    echo "Warning: Job output directory ${JOB_OUTPUT_DIR} not found. Skipping plotting."
 fi
 
 # --- Consolidate Run Summary ---
@@ -131,11 +177,18 @@ echo "Creating consolidated run summary: ${CONSOLIDATED_SUMMARY_FILE}"
     echo "Multiprocessing Batch Size: ${MP_BATCH_SIZE}"
     echo ""
 
-    echo "=== SYSTEM METRICS LOG (${SYSTEM_METRICS_LOG_FILE}) ==="
-    if [ -f "${SYSTEM_METRICS_LOG_FILE}" ]; then
-        cat "${SYSTEM_METRICS_LOG_FILE}"
-    else
-        echo "File not found."
+    echo "=== SYSTEM METRICS LOGS (from all nodes in ${JOB_OUTPUT_DIR}) ==="
+    METRICS_FILES_FOUND=0
+    for metrics_file in "${JOB_OUTPUT_DIR}"/system_metrics_*.csv; do
+        if [ -f "${metrics_file}" ]; then
+            echo "--- Log: ${metrics_file} ---"
+            cat "${metrics_file}"
+            echo -e "\n\n"
+            METRICS_FILES_FOUND=$((METRICS_FILES_FOUND + 1))
+        fi
+    done
+    if [ ${METRICS_FILES_FOUND} -eq 0 ]; then
+        echo "No system_metrics_*.csv files found in ${JOB_OUTPUT_DIR}."
     fi
     echo -e "\n\n"
 
